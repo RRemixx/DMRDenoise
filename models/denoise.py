@@ -87,6 +87,7 @@ class PointCloudDenoising(pl.LightningModule):
         if self.hparams.dataset.find(';') >= 0:
             print('[INFO] Using multiple datasets for training.')
             dataset = MultipleH5Dataset(self.hparams.dataset.split(';'), 'train', normal_name='train_normal', batch_size=self.hparams.batch_size, transform=t, random_get=True, subset_size=self.hparams.subset_size)
+            # dataset = MultipleH5Dataset(self.hparams.dataset.split(';'), 'train', normal_name='train_normal', batch_size=1, transform=t, random_get=True, subset_size=self.hparams.subset_size)
         else:
             dataset = H5Dataset(self.hparams.dataset, 'train', normal_name='train_normal', batch_size=self.hparams.batch_size, transform=t)
         return DataLoader(

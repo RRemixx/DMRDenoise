@@ -153,6 +153,64 @@ class UnsupervisedLoss(nn.Module):
         avg_dist = (dist * input_nbh_mask).sum(dim=-1) / num_nbh    # (B, N), average distance
 
         return avg_dist.sum()
+
+
+
+class ModifiedUnsupervisedLoss(nn.Module):
+    
+    def __init__(self, k=64, radius=0.05, pdf_std=0.5657, inv_scale=0.05, decay_epoch=80, emd_eps=0.005, emd_iters=50):
+        super().__init__()
+        self.knn = k
+        self.radius = radius
+        self.pdf_std = pdf_std
+        self.inv_scale = inv_scale
+        self.decay_epoch = decay_epoch
+        self.emd_eps = emd_eps
+        self.emd_iters = emd_iters
+
+    def stochastic_neighborhood(self, inputs):
+        """
+        param:  inputs:  (B, N, 3)
+        return: knn_idx: (B, N, k), Indices of neighboring points
+        return: mask:    (B, N, k), Mask
+        """
+        knn_idx, knn_dist = get_knn_idx_dist(inputs, query=inputs, k=self.knn, offset=1)    # (B, N, k), exclude self
+
+        # Gaussian spatial prior
+        SQRT_2PI = 2.5066282746
+        prob = torch.exp(- (knn_dist / (self.inv_scale ** 2)) / (2 * self.pdf_std ** 2)) / (self.pdf_std * SQRT_2PI)    # (B, N, k)
+        mask = torch.bernoulli(prob)    # (B, N, k)
+
+        prob = prob * (torch.sqrt(knn_dist) <= self.radius) # Radius cutoff
+
+        # If all the neighbor of a point are rejected, then accept at least one to avoid zero loss
+        # Here we accept the farthest one, because all-rejected probably happens when the point is displaced too far (high noise). 
+        mask_sum = mask.sum(dim=-1, keepdim=True)   # (B, N, 1)
+        mask_farthest = torch.where(mask_sum == 0, torch.ones_like(mask_sum), torch.zeros_like(mask_sum))       # (B, N, 1)
+        mask_delta = torch.cat([torch.zeros_like(mask_sum).repeat(1, 1, self.knn-1), mask_farthest], dim=-1)    # (B, N, k)
+        mask = mask + mask_delta    # (B, N, k)
+        
+        return knn_idx, mask, prob
+
+    def forward(self, preds, inputs, epoch, **kwargs):
+        _, assignment = emdFunction.apply(inputs, preds, self.emd_eps, self.emd_iters) # (B, N), assign each input point to a predicted point
+
+        # Permute the predicted points according to the assignment
+        # One-to-one correspondent to input points
+        permuted_preds = gather(preds, idx=assignment.long())  # (B, N, 3)
+
+        input_nbh_idx, input_nbh_mask, _ = self.stochastic_neighborhood(inputs)    # (B, N, k), (B, N, k)
+        input_nbh_pos = group(inputs, idx=input_nbh_idx)    # (B, N, k, 3)
+
+        dist = (permuted_preds.unsqueeze(dim=-2).expand_as(input_nbh_pos) - input_nbh_pos)  # (B, N, k, 3)
+        dist = (dist ** 2).sum(dim=-1)  # (B, N, k), squared-L2 distance
+
+        num_nbh = input_nbh_mask.sum(dim=-1)    # (B, N), number of neighbors
+        avg_dist = (dist * input_nbh_mask).sum(dim=-1) / num_nbh    # (B, N), average distance
+
+        return avg_dist.sum()
+
+
         
 
 def get_loss_layer(name):
