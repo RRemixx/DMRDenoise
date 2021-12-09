@@ -169,23 +169,49 @@ class ModifiedUnsupervisedLoss(nn.Module):
         self.emd_iters = emd_iters
 
 
+    def stochastic_neighborhood(self, inputs):
+        """
+        param:  inputs:  (B, N, 3)
+        return: knn_idx: (B, N, k), Indices of neighboring points
+        return: mask:    (B, N, k), Mask
+        """
+        knn_idx, knn_dist = get_knn_idx_dist(inputs, query=inputs, k=self.knn, offset=1)    # (B, N, k), exclude self
+
+        # Gaussian spatial prior
+        SQRT_2PI = 2.5066282746
+        prob = torch.exp(- (knn_dist / (self.inv_scale ** 2)) / (2 * self.pdf_std ** 2)) / (self.pdf_std * SQRT_2PI)    # (B, N, k)
+        mask = torch.bernoulli(prob)    # (B, N, k)
+
+        prob = prob * (torch.sqrt(knn_dist) <= self.radius) # Radius cutoff
+
+        # If all the neighbor of a point are rejected, then accept at least one to avoid zero loss
+        # Here we accept the farthest one, because all-rejected probably happens when the point is displaced too far (high noise). 
+        mask_sum = mask.sum(dim=-1, keepdim=True)   # (B, N, 1)
+        mask_farthest = torch.where(mask_sum == 0, torch.ones_like(mask_sum), torch.zeros_like(mask_sum))       # (B, N, 1)
+        mask_delta = torch.cat([torch.zeros_like(mask_sum).repeat(1, 1, self.knn-1), mask_farthest], dim=-1)    # (B, N, k)
+        mask = mask + mask_delta    # (B, N, k)
+        
+        return knn_idx, mask, prob
+
+
     def forward(self, preds, inputs, epoch, **kwargs):
-        _, assignment = emdFunction.apply(inputs, preds, self.emd_eps, self.emd_iters) # (B, N), assign each input point to a predicted point
-
-        # Permute the predicted points according to the assignment
-        # One-to-one correspondent to input points
+        _, assignment = emdFunction.apply(inputs, preds, self.emd_eps, self.emd_iters) # (B, N), assign each input point to a 
         permuted_preds = gather(preds, idx=assignment.long())  # (B, N, 3)
-
         input_nbh_idx, input_nbh_mask, _ = self.stochastic_neighborhood(inputs)    # (B, N, k), (B, N, k)
         input_nbh_pos = group(inputs, idx=input_nbh_idx)    # (B, N, k, 3)
-
         dist = (permuted_preds.unsqueeze(dim=-2).expand_as(input_nbh_pos) - input_nbh_pos)  # (B, N, k, 3)
         dist = (dist ** 2).sum(dim=-1)  # (B, N, k), squared-L2 distance
-
         num_nbh = input_nbh_mask.sum(dim=-1)    # (B, N), number of neighbors
         avg_dist = (dist * input_nbh_mask).sum(dim=-1) / num_nbh    # (B, N), average distance
-
-        return avg_dist.sum()
+        loss1 = avg_dist.sum()
+        # calculate loss2
+        # knn for input
+        _, input_knn_dist = get_knn_idx_dist(input, input, self.knn)
+        _, pred_knn_dist = get_knn_idx_dist(permuted_preds, permuted_preds, self.knn)
+        input_score = -input_knn_dist.sum()
+        pred_score = -pred_knn_dist.sum()
+        loss2 = pred_score - input_score
+        return loss1 + loss2
 
 
         
@@ -198,7 +224,7 @@ def get_loss_layer(name):
     elif name == 'proj':
         return ProjectionLoss()
     elif name == 'unsupervised':
-        return UnsupervisedLoss()
+        return ModifiedUnsupervisedLoss()
     elif name is None or name == 'None':
         return None
     else:
